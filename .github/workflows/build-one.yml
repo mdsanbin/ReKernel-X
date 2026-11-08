@@ -1,0 +1,52 @@
+name: Build Single LKM
+
+on:
+  workflow_dispatch:
+    inputs:
+      kmi:
+        description: 'KMI (e.g. android15-6.6)'
+        required: true
+        default: 'android15-6.6'
+      ddk_release:
+        description: 'DDK release (e.g. 20260313)'
+        required: true
+        default: '20260313'
+      rkx_version:
+        description: 'RKX_VERSION string'
+        required: true
+        default: '1.6-fix1'
+
+jobs:
+  build-ko:
+    name: Build LKM for ${{ inputs.kmi }}-${{ inputs.ddk_release }}
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk:${{ inputs.kmi }}-${{ inputs.ddk_release }}
+      options: --privileged
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+
+      - name: Build rekernel_x.ko
+        run: |
+          KMI=${{ inputs.kmi }}
+          echo "=== Building rekernel_x.ko for KMI: $KMI ==="
+          cp -r ./LKM-Source /opt/ddk/src/$KMI/drivers/rekernel_x
+          cd /opt/ddk/src/$KMI
+          make -C /opt/ddk/kdir/$KMI \
+            M=/opt/ddk/src/$KMI/drivers/rekernel_x \
+            CC="clang" \
+            RKX_VERSION="${{ inputs.rkx_version }}" \
+            modules
+
+          mkdir -p /github/workspace/out
+          cp /opt/ddk/src/$KMI/drivers/rekernel_x/rekernel_x.ko /github/workspace/out/rekernel_x-${{ inputs.kmi }}.ko
+          llvm-strip -d /github/workspace/out/rekernel_x-${{ inputs.kmi }}.ko
+          ls -la /github/workspace/out/
+
+      - name: Upload LKM
+        uses: actions/upload-artifact@v7
+        with:
+          name: rekernel_x-${{ inputs.kmi }}
+          path: /github/workspace/out/rekernel_x-${{ inputs.kmi }}.ko

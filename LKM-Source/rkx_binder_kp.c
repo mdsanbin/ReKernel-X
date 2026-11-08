@@ -1,7 +1,15 @@
 /*
  * Copyright (c) 2026 myflavor <admin@myflv.cn>. All rights reserved.
  * Based on Re-Kernel project by nep_timeline@outlook.com.
- * File: rkx_binder_kp.c — Kprobe hooks for Binder transaction filtering.
+ * File: rkx_binder_kp.c — Binder async free (free-async) hooks.
+ *
+ * Two attach strategies, in order:
+ *   1. trace/hooks tracepoint android_vh_binder_proc_transaction  (portable)
+ *   2. kprobe on binder_proc_transaction                          (legacy)
+ *
+ * The tracepoint exists on every GKI kernel that carries the Android vendor
+ * hooks, even when binder_proc_transaction has been inlined by LTO and has no
+ * kallsyms entry of its own (which is what happens on custom 6.6 kernels).
  */
 
 #include "rkx_log.h"
@@ -17,6 +25,8 @@
 #include <linux/string.h>
 #include <linux/version.h>
 #include <linux/workqueue.h>
+#include <linux/tracepoint.h>
+#include <trace/hooks/binder.h>
 #include "../android/binder_internal.h"
 
 static unsigned long (*k_kallsyms_lookup_name)(const char* name);
@@ -217,61 +227,120 @@ static void __nocfi rkx_queue_free_txn(struct rkx_free_txn_work *w,
 	queue_work(rkx_free_wq, &w->work);
 }
 
+/*
+ * Shared body of both hooks: drop the stale async transaction queued on the
+ * node when a newer one with the same signature arrives for a frozen target.
+ * Caller must hold node->lock and proc->inner_lock (both hooks below do).
+ */
+static void __nocfi rkx_try_free_outdated(struct binder_proc *proc,
+	struct binder_node *node, struct binder_transaction *t)
+{
+	struct binder_transaction *t_outdated;
+	struct rkx_free_txn_work *w;
+	struct binder_buffer *buffer;
+	char rpc_name[RKX_INTERFACETOKEN_BUFF_SIZE] = {0};
+	u8 strategy;
+
+	strategy = RKX_FREE_ASYNC_BY_CODE;
+	if (rkx_free_async_has_entries() &&
+	    rkx_parse_interface_token(proc, t->buffer, rpc_name, sizeof(rpc_name)))
+		rkx_free_async_lookup_rcu(rpc_name, t->code, &strategy);
+	if (strategy == RKX_FREE_ASYNC_SKIP)
+		return;
+
+	t_outdated = rk_binder_find_outdated_transaction_ilocked(t, &node->async_todo, strategy);
+	if (!t_outdated)
+		return;
+
+	w = kzalloc(sizeof(*w), GFP_ATOMIC);
+	if (!w)
+		return;
+
+	proc->tmp_ref++;
+	list_del_init(&t_outdated->work.entry);
+	proc->outstanding_txns--;
+
+	buffer = t_outdated->buffer;
+	rkx_log_debug("free_outdated uid=%u rpc=%s code=%d strategy=%u debug_id=%d data_size=%zu\n",
+		task_uid(proc->tsk).val, rpc_name, t->code, strategy, t_outdated->debug_id, buffer->data_size);
+	t_outdated->buffer = NULL;
+	buffer->transaction = NULL;
+	rkx_queue_free_txn(w, proc, t_outdated, buffer);
+}
+
+/*
+ * Path 1: android_vh_binder_proc_transaction tracepoint.
+ *
+ * Invoked from inside binder_proc_transaction() *after* binder_node_lock() and
+ * binder_inner_proc_lock() were taken, so the binder locks are already held and
+ * we must stay in atomic context. The buffer copy helpers used below are
+ * lock-free (memcpy_from_page), so this is safe.
+ */
+static void __nocfi rkx_binder_proc_transaction_vh(void *data,
+	struct task_struct *caller_task, struct task_struct *binder_proc_task,
+	struct task_struct *binder_th_task, int node_debug_id,
+	struct binder_transaction *t, bool pending_async)
+{
+	struct binder_proc *proc;
+	struct binder_node *node;
+	static bool logged_first_hit;
+
+	if (!t || !pending_async || !(t->flags & TF_ONE_WAY))
+		return;
+
+	proc = t->to_proc;
+	if (!proc || !binder_proc_task || !proc->tsk || proc->is_dead || proc->is_frozen)
+		return;
+	if (!rkx_is_frozen(proc->tsk))
+		return;
+
+	node = t->buffer ? t->buffer->target_node : NULL;
+	if (!node || !node->has_async_transaction)
+		return;
+
+	if (!logged_first_hit) {
+		logged_first_hit = true;
+		rkx_log_info("free-async active (tracepoint, uid=%u)\n",
+			task_uid(proc->tsk).val);
+	}
+
+	rkx_try_free_outdated(proc, node, t);
+}
+
+/*
+ * Path 2: legacy kprobe on binder_proc_transaction (function entry, locks not
+ * yet taken, may sleep - but we only use GFP_ATOMIC/queue_work anyway).
+ */
 static int __nocfi rkx_binder_proc_transaction_pre(struct kprobe* p, struct pt_regs* regs)
 {
 	struct binder_transaction* t = (struct binder_transaction*)regs->regs[0];
 	struct binder_proc* proc = (struct binder_proc*)regs->regs[1];
 
-	struct binder_node* node = t->buffer->target_node;
-	struct binder_transaction* t_outdated = NULL;
-	struct rkx_free_txn_work* w = NULL;
-	char rpc_name[RKX_INTERFACETOKEN_BUFF_SIZE] = {0};
-	u8 strategy;
+	struct binder_node* node;
 
-	if (!(t->flags & TF_ONE_WAY))
+	if (!t || !proc || !(t->flags & TF_ONE_WAY))
+		return 0;
+	if (!proc->tsk || !rkx_is_frozen(proc->tsk))
 		return 0;
 
-	if (rkx_is_frozen(proc->tsk)) {
-		strategy = RKX_FREE_ASYNC_BY_CODE;
-		if (rkx_free_async_has_entries() && rkx_parse_interface_token(proc, t->buffer, rpc_name, sizeof(rpc_name)))
-			rkx_free_async_lookup_rcu(rpc_name, t->code, &strategy);
-		if (strategy == RKX_FREE_ASYNC_SKIP)
-			return 0;
+	node = t->buffer ? t->buffer->target_node : NULL;
+	if (!node)
+		return 0;
 
-		rk_binder_node_lock(node);
-		if (!node->has_async_transaction) {
-			rk_binder_node_unlock(node);
-			return 0;
-		}
-		rk_binder_inner_proc_lock(proc);
-		if (proc->is_dead || proc->is_frozen) {
-			rk_binder_inner_proc_unlock(proc);
-			rk_binder_node_unlock(node);
-			return 0;
-		}
-		t_outdated = rk_binder_find_outdated_transaction_ilocked(t, &node->async_todo, strategy);
-		if (t_outdated) {
-			w = kzalloc(sizeof(*w), GFP_ATOMIC);
-			if (w) {
-				proc->tmp_ref++;
-				list_del_init(&t_outdated->work.entry);
-				proc->outstanding_txns--;
-			} else {
-				t_outdated = NULL;
-			}
-		}
+	rk_binder_node_lock(node);
+	if (!node->has_async_transaction) {
+		rk_binder_node_unlock(node);
+		return 0;
+	}
+	rk_binder_inner_proc_lock(proc);
+	if (proc->is_dead || proc->is_frozen) {
 		rk_binder_inner_proc_unlock(proc);
 		rk_binder_node_unlock(node);
-
-		if (t_outdated) {
-			struct binder_buffer* buffer = t_outdated->buffer;
-			rkx_log_debug("free_outdated uid=%u rpc=%s code=%d strategy=%u debug_id=%d data_size=%zu\n",
-				task_uid(proc->tsk).val, rpc_name, t->code, strategy, t_outdated->debug_id, buffer->data_size);
-			t_outdated->buffer = NULL;
-			buffer->transaction = NULL;
-			rkx_queue_free_txn(w, proc, t_outdated, buffer);
-		}
+		return 0;
 	}
+	rkx_try_free_outdated(proc, node, t);
+	rk_binder_inner_proc_unlock(proc);
+	rk_binder_node_unlock(node);
 	return 0;
 }
 
@@ -284,6 +353,7 @@ static struct kprobe kp_binder_proc_transaction = {
 };
 
 static bool rkx_kp_registered;
+static bool rkx_vh_registered;
 
 void __nocfi rkx_register_binder_kp(void)
 {
@@ -323,6 +393,16 @@ void __nocfi rkx_register_binder_kp(void)
 		goto err;
 	}
 
+	/* Preferred: vendor-hook tracepoint, immune to LTO inlining. */
+	rc = register_trace_android_vh_binder_proc_transaction(
+		rkx_binder_proc_transaction_vh, NULL);
+	if (rc == RKX_SUCCESS) {
+		rkx_vh_registered = true;
+		rkx_log_info("free-async armed via android_vh_binder_proc_transaction\n");
+		return;
+	}
+	rkx_log_warn("android_vh_binder_proc_transaction unavailable, rc=%d; trying kprobe\n", rc);
+
 	rc = register_kprobe(&kp_binder_proc_transaction);
 	if (rc != RKX_SUCCESS) {
 		rkx_log_err("register binder_proc_transaction kprobe failed, rc=%d (free-async disabled)\n", rc);
@@ -337,6 +417,11 @@ err:
 
 void rkx_unregister_binder_kp(void)
 {
+	if (rkx_vh_registered) {
+		unregister_trace_android_vh_binder_proc_transaction(
+			rkx_binder_proc_transaction_vh, NULL);
+		rkx_vh_registered = false;
+	}
 	if (rkx_kp_registered) {
 		unregister_kprobe(&kp_binder_proc_transaction);
 		rkx_kp_registered = false;
